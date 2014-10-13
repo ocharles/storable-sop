@@ -1,5 +1,6 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -23,6 +24,7 @@ module Generics.SOP.Storable
   , gsizeOf
   ) where
 
+import Control.Applicative
 import Control.Monad (void)
 import Data.Proxy (Proxy(Proxy))
 import Foreign (Ptr, castPtr, plusPtr)
@@ -38,10 +40,16 @@ storable = Proxy
 
 --------------------------------------------------------------------------------
 -- | Information about how a specific field should be laid out in memory.
-data LayoutInfo = LayoutInfo
+data LayoutInfo a = LayoutInfo
   { layoutFieldOffset :: Int
     -- ^ A byte offset from the initial data pointer to this field.
   }
+
+
+--------------------------------------------------------------------------------
+-- | How to tag the occurance of each constructor.
+data ConstructorTags code where
+  ConstructorTags :: (Eq tag, Storable tag) => LayoutInfo tag -> NP (K tag) code -> ConstructorTags code
 
 
 --------------------------------------------------------------------------------
@@ -66,10 +74,11 @@ In this case, we construct our own 'Layout':
 
 -}
 data Layout code = Layout
-  { layoutOffsets :: POP (K LayoutInfo) code
+  { layoutOffsets :: POP LayoutInfo code
     -- ^ A specification of how each field is laid out.
   , layoutSize :: !Int
     -- ^ The overall size in memory that serialization of this data type requires.
+  , layoutTags :: Maybe (ConstructorTags code)
   }
 
 
@@ -88,7 +97,8 @@ unarySequentialLayout :: forall a proxy xs. (Code a ~ '[xs], All Storable xs, Si
 unarySequentialLayout _ =
   Layout
     { layoutSize = sum (hcollapse sizes)
-    , layoutOffsets = POP (hliftA (K . LayoutInfo . unK) offsets :* Nil)
+    , layoutOffsets = POP (hliftA (LayoutInfo . unK) offsets :* Nil)
+    , layoutTags = Nothing
     }
 
   where
@@ -115,37 +125,78 @@ gsizeOf _ = layoutSize (layout (Proxy :: Proxy a))
 
 
 --------------------------------------------------------------------------------
--- | A generic implementation of 'peek'.
-gpeek :: forall a xs. (All2 Storable (Code a), Code a ~ '[xs], Generic a, HasLayout a, SingI xs) => Ptr a -> IO a
-gpeek ptr =
-  case layoutOffsets (layout (Proxy :: Proxy a)) of
-    POP (offsets :* _) ->
-      fmap (to . SOP . Z) $
-      hsequence (hcliftA storable
-                         (\(K info) ->
-                           peek (castPtr $ ptr `plusPtr` layoutFieldOffset info))
-                         offsets)
+data Path :: [k] -> * where
+  Here :: Path xs
+  There :: Path xs -> Path (x ': xs)
 
+
+--------------------------------------------------------------------------------
+-- | A generic implementation of 'peek'.
+gpeek :: forall a. (All SingI (Code a), All2 Storable (Code a), Generic a, HasLayout a) => Ptr a -> IO a
+gpeek ptr = do
+  let l = layout (Proxy :: Proxy a)
+  somePath <-
+    case layoutTags l of
+      Nothing ->
+        return Here
+
+      Just (ConstructorTags info tags) -> do
+        tag <- peek (castPtr $ ptr `plusPtr` layoutFieldOffset info)
+        let findCtor :: forall code tag. Eq tag => tag -> NP (K tag) code -> Path code
+            findCtor _ Nil =
+              error "Generics.SOP.gpeek: Unknown constructor"
+            findCtor t (K x :* xs)
+              | x == t     = Here
+              | otherwise = There (findCtor t xs)
+        return (findCtor tag tags)
+
+  to . SOP <$> go somePath (layoutOffsets l)
+
+  where
+  go :: forall code. (All2 Storable code,All SingI code) => Path code -> POP LayoutInfo code -> IO (NS (NP I) code)
+  go Here (POP (offsets :* _)) =
+    fmap Z $
+    hsequence (hcliftA storable
+                       (\info ->
+                          peek (castPtr $ ptr `plusPtr` layoutFieldOffset info))
+                       offsets)
+  go (There p) (POP (_ :* offsets)) =
+    fmap S $
+    go p (POP offsets)
 
 --------------------------------------------------------------------------------
 -- | A generic implementation of 'poke'.
 gpoke :: forall a. (All SingI (Code a), All2 Storable (Code a), Generic a, HasLayout a) => Ptr a -> a -> IO ()
 gpoke ptr (from -> SOP sop) =
-  pokeCtor sop (layoutOffsets (layout (Proxy :: Proxy a)))
-
+  let l = layout (Proxy :: Proxy a)
+  in pokeCtor sop
+              (layoutOffsets l)
+              (layoutTags l)
   where
-  pokeCtor :: forall code. (All2 Storable code,All SingI code) => NS (NP I) code -> POP (K LayoutInfo) code -> IO ()
-  pokeCtor (Z np) (POP (offsets :* _)) =
+  pokeCtor :: forall code. (All2 Storable code,All SingI code) => NS (NP I) code -> POP LayoutInfo code -> Maybe (ConstructorTags code) -> IO ()
+  pokeCtor (Z np) (POP (offsets :* _)) tags = do
+    case tags of
+      Just (ConstructorTags ctorInfo (K t :* _)) ->
+        poke (castPtr $ ptr `plusPtr` layoutFieldOffset ctorInfo)
+             t
+      _ -> return ()
+
     void $
-    hsequenceK
-      (hcliftA2 storable
-                (\(I x) (K info) ->
-                   K (poke (castPtr $ ptr `plusPtr`
-                            fromIntegral (layoutFieldOffset info))
-                           x))
-                np
-                offsets)
-  pokeCtor (S s) (POP (_ :* offsets)) =
-    pokeCtor s (POP offsets)
-  pokeCtor _ _ =
+      do
+        hsequenceK
+          (hcliftA2 storable
+                    (\(I x) info ->
+                       K (poke (castPtr $ ptr `plusPtr`
+                                fromIntegral (layoutFieldOffset info))
+                               x))
+                    np
+                    offsets)
+  pokeCtor (S s) (POP (_ :* offsets)) ctors =
+    pokeCtor s
+             (POP offsets)
+             (case ctors of
+                Just (ConstructorTags info (_ :* tags)) ->
+                  Just (ConstructorTags info tags)
+                _ -> Nothing)
+  pokeCtor _ _ _ =
     error "Generics.SOP.Storable.gpoke.pokeCtor: Unreachable code reached. Please report this as a bug."

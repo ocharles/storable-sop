@@ -3,7 +3,7 @@
 cabal.mkDerivation (self: {
   pname = "storable-sop";
   version = "1.0.0";
-  sha256 = "nil";
+  src = ./.;
   buildDepends = [ genericsSop ];
   meta = {
     homepage = "http://github.com/ocharles/storable-sop";
