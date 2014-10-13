@@ -27,7 +27,7 @@ import Control.Monad (void)
 import Data.Proxy (Proxy(Proxy))
 import Foreign (Ptr, castPtr, plusPtr)
 import Foreign.Storable (Storable, peek, poke, sizeOf)
-import Generics.SOP (All, All2, Code, Generic, I(I), K(K), NP(Nil, (:*)), NS(Z),
+import Generics.SOP (All, All2, Code, Generic, I(I), K(K), NP(Nil, (:*)), NS(Z, S),
                      POP(POP), SingI, SOP(SOP), from, hcliftA, hcliftA2,
                      hcollapse, hliftA, hpure, hsequence, hsequenceK, to, unK)
 
@@ -129,17 +129,23 @@ gpeek ptr =
 
 --------------------------------------------------------------------------------
 -- | A generic implementation of 'poke'.
-gpoke :: forall a xs. (All2 Storable (Code a), Code a ~ '[xs], Generic a, HasLayout a, SingI xs) => Ptr a -> a -> IO ()
-gpoke ptr (from -> SOP (Z np)) =
-  case layoutOffsets (layout (Proxy :: Proxy a)) of
-    POP (offsets :* _) ->
-      void $
-      hsequenceK
-        (hcliftA2 storable
-                  (\(I x) (K info) ->
-                     K (poke (castPtr $ ptr `plusPtr`
-                              fromIntegral (layoutFieldOffset info))
-                             x))
-                  np
-                  offsets)
-gpoke _ _ = error "Generics.SOP.Storable.gpoke: Unreachable code... reached? Please report this as a bug."
+gpoke :: forall a. (All SingI (Code a), All2 Storable (Code a), Generic a, HasLayout a) => Ptr a -> a -> IO ()
+gpoke ptr (from -> SOP sop) =
+  pokeCtor sop (layoutOffsets (layout (Proxy :: Proxy a)))
+
+  where
+  pokeCtor :: forall code. (All2 Storable code,All SingI code) => NS (NP I) code -> POP (K LayoutInfo) code -> IO ()
+  pokeCtor (Z np) (POP (offsets :* _)) =
+    void $
+    hsequenceK
+      (hcliftA2 storable
+                (\(I x) (K info) ->
+                   K (poke (castPtr $ ptr `plusPtr`
+                            fromIntegral (layoutFieldOffset info))
+                           x))
+                np
+                offsets)
+  pokeCtor (S s) (POP (_ :* offsets)) =
+    pokeCtor s (POP offsets)
+  pokeCtor _ _ =
+    error "Generics.SOP.Storable.gpoke.pokeCtor: Unreachable code reached. Please report this as a bug."
